@@ -1,15 +1,10 @@
-"""
-app.py
-Demo hệ thống hỗ trợ lựa chọn xe ô tô theo nhu cầu sử dụng, dùng thuật toán KNN.
-Chạy bằng: streamlit run app.py
-"""
 
 import streamlit as st
 import pandas as pd
 
 from recommender import load_and_clean_data, CarRecommender, DEFAULT_WEIGHTS
 
-st.set_page_config(page_title="Gợi ý xe ô tô theo nhu cầu (KNN)", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="Gợi ý xe ô tô theo nhu cầu", layout="wide")
 
 
 @st.cache_data
@@ -28,11 +23,11 @@ def format_vnd(value: float) -> str:
 
 df = get_data()
 
-st.title("🚗 Hệ thống hỗ trợ lựa chọn xe ô tô theo nhu cầu sử dụng")
-st.caption("Đồ án môn Hệ trợ giúp quyết định — Gợi ý xe bằng thuật toán K-Nearest Neighbors (KNN)")
+st.title("Hệ thống hỗ trợ lựa chọn xe ô tô theo nhu cầu sử dụng")
+st.caption("Nhóm 8 · Đồ án môn Hệ trợ giúp quyết định — Gợi ý xe bằng thuật toán K-Nearest Neighbors (KNN)")
 
 with st.sidebar:
-    st.header("⚙️ Trọng số thuộc tính")
+    st.header(" Trọng số thuộc tính")
     st.caption("Điều chỉnh mức độ ưu tiên khi tính độ tương đồng giữa các xe.")
     w_price = st.slider("Giá", 0.0, 3.0, DEFAULT_WEIGHTS["Giá( VNĐ)"], 0.1)
     w_power = st.slider("Công suất", 0.0, 3.0, DEFAULT_WEIGHTS["Công suất(HP)"], 0.1)
@@ -63,15 +58,19 @@ col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     use_price = st.checkbox("Có yêu cầu về giá", value=True)
-    price = st.slider(
+    # Hiển thị thanh trượt theo đơn vị "triệu VNĐ" cho số ngắn, dễ nhìn hơn
+    # (thay vì phải hiện cả dãy số 000.000 dài).
+    price_trieu = st.slider(
         "Ngân sách (VNĐ)",
-        min_value=int(df["Giá( VNĐ)"].min()),
-        max_value=int(df["Giá( VNĐ)"].max()),
-        value=int(df["Giá( VNĐ)"].median()),
-        step=10_000_000,
+        min_value=int(df["Giá( VNĐ)"].min() / 1_000_000),
+        max_value=int(df["Giá( VNĐ)"].max() / 1_000_000),
+        value=int(df["Giá( VNĐ)"].median() / 1_000_000),
+        step=10,
         disabled=not use_price,
-        format="%d",
     )
+    price = price_trieu * 1_000_000
+    if use_price:
+        st.caption(f"≈ {format_vnd(price)}")
 
 with col2:
     use_power = st.checkbox("Có yêu cầu về công suất", value=False)
@@ -109,7 +108,7 @@ with col7:
 
 st.divider()
 
-if st.button("🔍 Tìm xe phù hợp", type="primary", use_container_width=False):
+if st.button("Tìm xe phù hợp", type="primary", use_container_width=False):
     query = {}
     if use_price:
         query["Giá( VNĐ)"] = price
@@ -156,7 +155,7 @@ if st.button("🔍 Tìm xe phù hợp", type="primary", use_container_width=Fals
 
         st.bar_chart(result.set_index("Tên xe")["Độ phù hợp (%)"])
 
-with st.expander("ℹ️ Về hệ thống này"):
+with st.expander(" Về hệ thống này"):
     st.markdown(
         """
         - Đây là hệ gợi ý dựa trên nội dung (**content-based recommendation**), dùng
