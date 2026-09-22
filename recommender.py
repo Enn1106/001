@@ -1,19 +1,47 @@
 """
 recommender.py
-Xử lý dữ liệu và xây dựng mô hình KNN (Nearest Neighbors) để gợi ý xe
-dựa trên tiêu chí khách hàng nhập vào.
+
+Xử lý dữ liệu và xây dựng mô hình KNN (Nearest Neighbors)
+để gợi ý xe dựa trên tiêu chí khách hàng nhập vào.
+
+Luồng chính:
+- Làm sạch dữ liệu CSV
+- Log-transform Giá và Công suất để giảm ảnh hưởng của giá trị ngoại lệ
+- Chuẩn hóa thuộc tính số bằng MinMaxScaler về [0, 1]
+- One-Hot Encoding thuộc tính phân loại
+- Áp dụng trọng số cho từng thuộc tính
+- Dùng KNN + Euclidean Distance để tìm Top-K xe gần nhất
+- Tính mức độ đáp ứng từng tiêu chí để giải thích kết quả
 """
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.neighbors import NearestNeighbors
 
-NUMERIC_COLS = ["Giá( VNĐ)", "Công suất(HP)", "Chỗ ngồi"]
-CATEGORICAL_COLS = ["Nhiên liệu", "Mục đích", "Tình trạng", "Kiểu xe", "Hộp số"]
 
-# Trọng số mặc định cho từng thuộc tính khi tính khoảng cách.
-# Giá và Công suất được ưu tiên cao hơn theo yêu cầu của đồ án.
+NUMERIC_COLS = [
+    "Giá( VNĐ)",
+    "Công suất(HP)",
+    "Chỗ ngồi",
+]
+
+# Không đưa "Giá" và "Công suất" trực tiếp vào MinMaxScaler.
+# Hai thuộc tính này sẽ được log1p trước rồi mới MinMaxScaler.
+LOG_NUMERIC_COLS = [
+    "Giá( VNĐ)",
+    "Công suất(HP)",
+]
+
+CATEGORICAL_COLS = [
+    "Nhiên liệu",
+    "Mục đích",
+    "Tình trạng",
+    "Kiểu xe",
+    "Hộp số",
+]
+
+
 DEFAULT_WEIGHTS = {
     "Giá( VNĐ)": 2.0,
     "Công suất(HP)": 1.5,
@@ -26,124 +54,578 @@ DEFAULT_WEIGHTS = {
 }
 
 
-def load_and_clean_data(path: str) -> pd.DataFrame:
-    """Đọc CSV gốc và làm sạch dữ liệu."""
-    df = pd.read_csv(path)
+def load_and_clean_data(file_path):
+    """
+    Đọc và làm sạch dữ liệu từ CSV.
+    """
 
-    # Giá: "458.000.000" -> 458000000
-    df["Giá( VNĐ)"] = (
-        df["Giá( VNĐ)"].astype(str).str.replace(".", "", regex=False).astype(float)
-    )
+    df = pd.read_csv(file_path)
 
-    # Công suất: chuỗi số (có thể dùng dấu phẩy thập phân kiểu VN, vd "134,1") -> float
-    df["Công suất(HP)"] = (
-        df["Công suất(HP)"].astype(str).str.replace(",", ".", regex=False).astype(float)
-    )
+    # -----------------------------
+    # Làm sạch dữ liệu số
+    # -----------------------------
+    if "Giá( VNĐ)" in df.columns:
+        df["Giá( VNĐ)"] = (
+            df["Giá( VNĐ)"]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df["Giá( VNĐ)"] = pd.to_numeric(
+            df["Giá( VNĐ)"],
+            errors="coerce"
+        )
 
-    # Chuẩn hóa lỗi chính tả Nhiên liệu: "HYBRID" / "Hybrid" -> "Hybrid"
-    df["Nhiên liệu"] = df["Nhiên liệu"].str.strip().str.title()
-    df["Nhiên liệu"] = df["Nhiên liệu"].replace({"Hybrid": "Hybrid"})
+    if "Công suất(HP)" in df.columns:
+        df["Công suất(HP)"] = (
+            df["Công suất(HP)"]
+            .astype(str)
+            .str.replace(",", ".", regex=False)
+            .str.strip()
+        )
+        df["Công suất(HP)"] = pd.to_numeric(
+            df["Công suất(HP)"],
+            errors="coerce"
+        )
 
-    # Chuẩn hóa khoảng trắng thừa ở các cột phân loại khác
+    if "Chỗ ngồi" in df.columns:
+        df["Chỗ ngồi"] = pd.to_numeric(
+            df["Chỗ ngồi"],
+            errors="coerce"
+        )
+
+    # -----------------------------
+    # Làm sạch dữ liệu phân loại
+    # -----------------------------
     for col in CATEGORICAL_COLS:
-        if col != "Nhiên liệu":
+        if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    df = df.reset_index(drop=True)
+    # Chuẩn hóa riêng Nhiên liệu:
+    # HYBRID / Hybrid / hybrid -> Hybrid
+    if "Nhiên liệu" in df.columns:
+        df["Nhiên liệu"] = df["Nhiên liệu"].str.title()
+
+    # -----------------------------
+    # Xóa dòng thiếu dữ liệu cần thiết
+    # -----------------------------
+    required_cols = NUMERIC_COLS + CATEGORICAL_COLS
+    required_cols = [
+        col for col in required_cols
+        if col in df.columns
+    ]
+
+    df = df.dropna(subset=required_cols)
+
+    # Xóa dòng trùng hoàn toàn
+    df = df.drop_duplicates().reset_index(drop=True)
+
     return df
 
 
 class CarRecommender:
-    """
-    Bọc toàn bộ pipeline: chuẩn hóa số, one-hot encoding, áp trọng số,
-    và tìm K hàng xóm gần nhất bằng NearestNeighbors.
-    """
+    def __init__(self, df, weights=None):
+        self.df = df.copy()
 
-    def __init__(self, df: pd.DataFrame, weights: dict | None = None):
-        self.df = df.reset_index(drop=True)
-        self.weights = weights or DEFAULT_WEIGHTS
-
-        # --- Chuẩn hóa các cột số về [0, 1] ---
-        self.scaler = MinMaxScaler()
-        self.numeric_scaled = pd.DataFrame(
-            self.scaler.fit_transform(self.df[NUMERIC_COLS]),
-            columns=NUMERIC_COLS,
+        self.weights = (
+            DEFAULT_WEIGHTS.copy()
+            if weights is None
+            else weights.copy()
         )
 
-        # --- One-hot encoding cho các cột phân loại ---
-        self.encoded_cat = pd.get_dummies(self.df[CATEGORICAL_COLS], prefix=CATEGORICAL_COLS)
+        # -----------------------------
+        # Chuẩn hóa dữ liệu số
+        # -----------------------------
+        self.scaler = MinMaxScaler()
 
-        # Ghi nhớ để tra cứu cột nào thuộc thuộc tính gốc nào (dùng khi áp trọng số)
+        numeric_data = self.df[NUMERIC_COLS].copy()
+
+        # Log-transform Giá và Công suất.
+        # Chỗ ngồi giữ nguyên vì đây là thuộc tính số có phạm vi nhỏ.
+        for col in LOG_NUMERIC_COLS:
+            numeric_data[col] = np.log1p(numeric_data[col])
+
+        self.scaled_numeric = pd.DataFrame(
+            self.scaler.fit_transform(numeric_data),
+            columns=NUMERIC_COLS,
+            index=self.df.index
+        )
+
+        # -----------------------------
+        # One-Hot Encoding
+        # -----------------------------
+        self.encoded_categorical = pd.get_dummies(
+            self.df[CATEGORICAL_COLS],
+            dtype=float
+        )
+
+        # Lưu mapping để encode query giống dữ liệu training
         self.cat_col_map = {}
+
         for col in CATEGORICAL_COLS:
-            self.cat_col_map[col] = [c for c in self.encoded_cat.columns if c.startswith(f"{col}_")]
+            prefix = f"{col}_"
 
-        self.feature_matrix = self._build_weighted_matrix()
+            self.cat_col_map[col] = [
+                encoded_col
+                for encoded_col in self.encoded_categorical.columns
+                if encoded_col.startswith(prefix)
+            ]
 
-        self.model = NearestNeighbors(metric="euclidean")
-        self.model.fit(self.feature_matrix.values)
-
-    def _build_weighted_matrix(self) -> pd.DataFrame:
-        parts = []
-        for col in NUMERIC_COLS:
-            w = self.weights.get(col, 1.0)
-            parts.append(self.numeric_scaled[[col]] * w)
-        for col in CATEGORICAL_COLS:
-            w = self.weights.get(col, 1.0)
-            sub_cols = self.cat_col_map[col]
-            if sub_cols:
-                parts.append(self.encoded_cat[sub_cols] * w)
-        return pd.concat(parts, axis=1)
-
-    def _encode_query(self, query: dict) -> np.ndarray:
+    def _active_columns(self, query):
         """
-        Chuyển 1 tiêu chí khách hàng (dict) thành vector cùng không gian
-        đặc trưng với feature_matrix. Thuộc tính không nhập sẽ được gán
-        giá trị trung tính (không lệch về hướng nào).
+        Chỉ lấy các tiêu chí thực sự được người dùng yêu cầu
+        và có trọng số > 0.
+
+        Điều này giúp:
+        "Không yêu cầu" -> không tham gia vào khoảng cách KNN.
         """
-        row = {}
 
-        # --- Số: nếu khách không nhập, dùng giá trị trung bình (đã scale = ~0.5 vùng giữa) ---
-        numeric_input = {
-            "Giá( VNĐ)": query.get("Giá( VNĐ)"),
-            "Công suất(HP)": query.get("Công suất(HP)"),
-            "Chỗ ngồi": query.get("Chỗ ngồi"),
-        }
-        numeric_df = pd.DataFrame([numeric_input])
+        active_columns = []
+
+        for col in NUMERIC_COLS + CATEGORICAL_COLS:
+            value = query.get(col)
+
+            if value is None:
+                continue
+
+            if isinstance(value, str):
+                if value.strip() == "":
+                    continue
+
+                if value.strip().lower() == "không yêu cầu":
+                    continue
+
+            weight = self.weights.get(col, 1.0)
+
+            if weight <= 0:
+                continue
+
+            active_columns.append(col)
+
+        return active_columns
+
+    def _transform_numeric_query(self, col, value):
+        """
+        Biến đổi query số theo đúng pipeline:
+        log1p -> MinMaxScaler.
+        """
+
+        value = float(value)
+
+        if col in LOG_NUMERIC_COLS:
+            value = np.log1p(value)
+
+        # scaler.transform cần đủ số cột theo thứ tự ban đầu.
+        raw_values = self.df[NUMERIC_COLS].copy()
+
+        for numeric_col in LOG_NUMERIC_COLS:
+            raw_values[numeric_col] = np.log1p(
+                raw_values[numeric_col]
+            )
+
+        temp_scaler = MinMaxScaler()
+        temp_scaler.fit(raw_values)
+
+        query_array = raw_values.iloc[0:1].copy()
+        query_array[col] = value
+
+        scaled = temp_scaler.transform(query_array)
+
+        col_index = NUMERIC_COLS.index(col)
+
+        return float(scaled[0, col_index])
+
+    def _build_weighted_matrix(self, active_columns):
+        """
+        Tạo ma trận đặc trưng sau khi áp dụng trọng số.
+
+        Thứ tự:
+        dữ liệu đã chuẩn hóa/encode
+        -> chọn tiêu chí active
+        -> nhân trọng số
+        """
+
+        feature_parts = []
+
+        for col in active_columns:
+
+            if col in NUMERIC_COLS:
+                values = self.scaled_numeric[[col]].to_numpy()
+
+                weight = self.weights.get(col, 1.0)
+
+                values = values * weight
+
+                feature_parts.append(values)
+
+            else:
+                encoded_cols = self.cat_col_map[col]
+
+                values = (
+                    self.encoded_categorical[encoded_cols]
+                    .to_numpy()
+                )
+
+                weight = self.weights.get(col, 1.0)
+
+                values = values * weight
+
+                feature_parts.append(values)
+
+        if not feature_parts:
+            return np.empty((len(self.df), 0))
+
+        return np.hstack(feature_parts)
+
+    def _encode_query(self, query, active_columns):
+        """
+        Encode query vào đúng không gian đặc trưng với dữ liệu xe.
+        """
+
+        query_features = []
+
+        for col in active_columns:
+
+            if col in NUMERIC_COLS:
+
+                value = query[col]
+
+                # Tạo vector đúng thứ tự để dùng scaler đã fit.
+                raw_query = self.df[NUMERIC_COLS].iloc[0:1].copy()
+
+                raw_query[col] = float(value)
+
+                for log_col in LOG_NUMERIC_COLS:
+                    raw_query[log_col] = np.log1p(
+                        raw_query[log_col]
+                    )
+
+                scaled = self.scaler.transform(raw_query)
+
+                col_index = NUMERIC_COLS.index(col)
+
+                query_value = scaled[0, col_index]
+
+                weight = self.weights.get(col, 1.0)
+
+                query_features.append([
+                    float(query_value) * weight
+                ])
+
+            else:
+
+                encoded_cols = self.cat_col_map[col]
+
+                query_vector = np.zeros(
+                    len(encoded_cols),
+                    dtype=float
+                )
+
+                query_value = str(query[col]).strip()
+
+                target_col = f"{col}_{query_value}"
+
+                if target_col in encoded_cols:
+                    index = encoded_cols.index(target_col)
+                    query_vector[index] = 1.0
+
+                weight = self.weights.get(col, 1.0)
+
+                query_features.append(
+                    query_vector * weight
+                )
+
+        if not query_features:
+            return np.empty((1, 0))
+
+        return np.concatenate(query_features).reshape(1, -1)
+
+    def _criterion_scores(self, car, query):
+        """
+        Tính điểm đáp ứng từng tiêu chí để giải thích kết quả.
+
+        Điểm này KHÔNG phải xác suất.
+
+        Với thuộc tính số:
+            score = max(0, 1 - |actual-target| / target) * 100
+
+        Với thuộc tính phân loại:
+            khớp = 100
+            không khớp = 0
+        """
+
+        scores = {}
+
         for col in NUMERIC_COLS:
-            if pd.isna(numeric_df[col].iloc[0]):
-                numeric_df[col] = self.numeric_scaled[col].mean() / (self.weights.get(col, 1.0) or 1)
-        scaled = self.scaler.transform(numeric_df[NUMERIC_COLS])[0]
-        for i, col in enumerate(NUMERIC_COLS):
-            row[col] = scaled[i] * self.weights.get(col, 1.0)
 
-        # --- Phân loại: one-hot, nếu không chọn thì để toàn bộ = 0 (không thiên vị) ---
+            target = query.get(col)
+
+            if target is None:
+                continue
+
+            if isinstance(target, str):
+                if target.strip().lower() == "không yêu cầu":
+                    continue
+
+            try:
+                target = float(target)
+                actual = float(car[col])
+
+                if target == 0:
+                    score = (
+                        100.0
+                        if actual == 0
+                        else 0.0
+                    )
+                else:
+                    score = max(
+                        0.0,
+                        1.0 - abs(actual - target) / abs(target)
+                    ) * 100.0
+
+                scores[col] = round(score, 1)
+
+            except (TypeError, ValueError):
+                continue
+
         for col in CATEGORICAL_COLS:
-            sub_cols = self.cat_col_map[col]
-            chosen = query.get(col)
-            for sc in sub_cols:
-                value = 1.0 if (chosen is not None and sc == f"{col}_{chosen}") else 0.0
-                row[sc] = value * self.weights.get(col, 1.0)
 
-        vector = pd.DataFrame([row])[self.feature_matrix.columns].values[0]
-        return vector
+            target = query.get(col)
 
-    def recommend(self, query: dict, k: int = 5) -> pd.DataFrame:
-        """Trả về top-k xe gần nhất với tiêu chí query."""
-        vector = self._encode_query(query).reshape(1, -1)
-        k = min(k, len(self.df))
-        distances, indices = self.model.kneighbors(vector, n_neighbors=k)
+            if target is None:
+                continue
 
-        # Chuẩn hóa "độ phù hợp" theo khoảng cách xa nhất trong TOÀN BỘ dataset
-        # (không chỉ trong top-k) để phần trăm phản ánh đúng mức tương đồng.
-        all_distances, _ = self.model.kneighbors(vector, n_neighbors=len(self.df))
-        max_d = all_distances.max() or 1.0
+            if str(target).strip().lower() == "không yêu cầu":
+                continue
 
-        result = self.df.iloc[indices[0]].copy()
-        result["Khoảng cách"] = distances[0]
-        result["Độ phù hợp (%)"] = ((1 - result["Khoảng cách"] / (max_d + 1e-9)) * 100).round(1)
-        result = result.sort_values("Khoảng cách").reset_index(drop=True)
+            actual = str(car[col]).strip()
+            target = str(target).strip()
+
+            scores[col] = (
+                100.0
+                if actual.lower() == target.lower()
+                else 0.0
+            )
+
+        return scores
+
+    def _overall_criterion_score(self, scores):
+        """
+        Tính điểm đáp ứng tổng thể bằng trung bình có trọng số.
+        """
+
+        if not scores:
+            return 0.0
+
+        total_score = 0.0
+        total_weight = 0.0
+
+        for col, score in scores.items():
+            weight = self.weights.get(col, 1.0)
+
+            if weight <= 0:
+                continue
+
+            total_score += score * weight
+            total_weight += weight
+
+        if total_weight == 0:
+            return 0.0
+
+        return round(
+            total_score / total_weight,
+            1
+        )
+
+    def _build_explanations(self, scores):
+        """
+        Sinh giải thích đơn giản, dễ trình bày trong đồ án.
+        """
+
+        explanations = []
+
+        for col, score in scores.items():
+
+            # -------------------------
+            # Giá
+            # -------------------------
+            if col == "Giá( VNĐ)":
+
+                if score >= 95:
+                    text = "✓ Giá rất gần ngân sách"
+
+                elif score >= 80:
+                    text = "✓ Giá tương đối gần ngân sách"
+
+                else:
+                    text = (
+                        "△ Giá chênh lệch khá nhiều "
+                        "so với ngân sách"
+                    )
+
+            # -------------------------
+            # Công suất
+            # -------------------------
+            elif col == "Công suất(HP)":
+
+                if score >= 95:
+                    text = "✓ Công suất gần mức mong muốn"
+
+                elif score >= 80:
+                    text = "△ Công suất có chênh lệch nhỏ"
+
+                else:
+                    text = (
+                        "△ Công suất chênh lệch đáng kể "
+                        "so với nhu cầu"
+                    )
+
+            # -------------------------
+            # Chỗ ngồi
+            # -------------------------
+            elif col == "Chỗ ngồi":
+
+                if score == 100:
+                    text = "✓ Đúng số chỗ yêu cầu"
+
+                elif score >= 80:
+                    text = "△ Số chỗ gần với nhu cầu"
+
+                else:
+                    text = "△ Số chỗ chênh lệch so với nhu cầu"
+
+            # -------------------------
+            # Thuộc tính phân loại
+            # -------------------------
+            else:
+
+                labels = {
+                    "Nhiên liệu": "nhiên liệu",
+                    "Mục đích": "mục đích sử dụng",
+                    "Tình trạng": "tình trạng",
+                    "Kiểu xe": "kiểu xe",
+                    "Hộp số": "hộp số",
+                }
+
+                label = labels.get(col, col)
+
+                if score == 100:
+                    text = f"✓ Đúng {label} yêu cầu"
+                else:
+                    text = f"△ Không khớp {label} yêu cầu"
+
+            explanations.append(text)
+
+        return explanations
+
+    def recommend(self, query, k=5):
+        """
+        Trả về Top-K xe gần nhu cầu nhất bằng KNN.
+
+        KNN sử dụng Euclidean Distance.
+        """
+
+        active_columns = self._active_columns(query)
+
+        if not active_columns:
+            raise ValueError(
+                "Bạn cần nhập ít nhất một tiêu chí tìm kiếm."
+            )
+
+        X = self._build_weighted_matrix(
+            active_columns
+        )
+
+        query_vector = self._encode_query(
+            query,
+            active_columns
+        )
+
+        # -----------------------------
+        # KNN
+        # -----------------------------
+        n_neighbors = min(
+            k,
+            len(self.df)
+        )
+
+        model = NearestNeighbors(
+            n_neighbors=n_neighbors,
+            metric="euclidean"
+        )
+
+        model.fit(X)
+
+        distances, indices = model.kneighbors(
+            query_vector
+        )
+
+        result = self.df.iloc[
+            indices[0]
+        ].copy()
+
+        result["Khoảng cách KNN"] = np.round(
+            distances[0],
+            4
+        )
+
+        overall_scores = []
+        details = []
+        explanations = []
+
+        for idx in result.index:
+
+            car = self.df.loc[idx]
+
+            scores = self._criterion_scores(
+                car,
+                query
+            )
+
+            overall_score = (
+                self._overall_criterion_score(
+                    scores
+                )
+            )
+
+            overall_scores.append(
+                overall_score
+            )
+
+            details.append(scores)
+
+            explanations.append(
+                self._build_explanations(
+                    scores
+                )
+            )
+
+        result["Điểm đáp ứng (%)"] = (
+            overall_scores
+        )
+
+        result["Chi tiết tiêu chí"] = details
+
+        result["Giải thích"] = explanations
+
+        # Sắp xếp theo đúng thứ tự KNN
+        result = result.reset_index(drop=True)
+
         return result
 
-    def unique_values(self, col: str):
-        return sorted(self.df[col].dropna().unique().tolist())
+    def unique_values(self, column):
+        """
+        Lấy danh sách giá trị duy nhất của một cột.
+        """
+
+        if column not in self.df.columns:
+            return []
+
+        return sorted(
+            self.df[column]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
